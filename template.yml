@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Sample state machine with HTTP endpoints
+
+Transform: AWS::LanguageExtensions
+
+Resources:
+
+  EventsConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: anonymous
+      AuthorizationType: API_KEY
+      AuthParameters: 
+        ApiKeyAuthParameters: 
+          ApiKeyName: user-agent
+          ApiKeyValue: x
+        InvocationHttpParameters: {}
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: GetGMsByCountry
+      RoleArn: !GetAtt StateMachineIAMRole.Arn
+      DefinitionString:
+        Fn::ToJsonString:
+          Comment: Sample state machine with HTTP endpoints
+          StartAt: Get list of GMs
+          States:
+            Get list of GMs:
+              Type: Task
+              Resource: arn:aws:states:::http:invoke
+              Parameters:
+                ApiEndpoint: https://api.chess.com/pub/titled/GM
+                Method: GET
+                Authentication:
+                  ConnectionArn: !GetAtt EventsConnection.Arn
+              Retry:
+                - ErrorEquals:
+                    - States.ALL
+                  BackoffRate: 2
+                  IntervalSeconds: 1
+                  MaxAttempts: 3
+                  JitterStrategy: FULL
+              Next: For each GM
+              OutputPath: $.ResponseBody
+            For each GM:
+              Type: Map
+              ItemProcessor:
+                ProcessorConfig:
+                  Mode: INLINE
+                StartAt: Get GM info
+                States:
+                  Get GM info:
+                    Type: Task
+                    Resource: arn:aws:states:::http:invoke
+                    Parameters:
+                      Authentication:
+                        ConnectionArn: !GetAtt EventsConnection.Arn
+                      ApiEndpoint.$: States.Format('https://api.chess.com/pub/player/{}', $)
+                      Method: GET
+                    Retry:
+                      - ErrorEquals:
+                          - States.ALL
+                        JitterStrategy: FULL
+                        IntervalSeconds: 2
+                        MaxAttempts: 10
+                        BackoffRate: 1.5
+                    ResultSelector:
+                      output.$: States.JsonMerge(States.StringToJson('{"name":"Unknown Player"}'), $.ResponseBody, false)
+                    Next: Construct display name
+                  Construct display name:
+                    Type: Pass
+                    End: true
+                    Parameters:
+                      displayName.$: States.Format('{} ({})', $.output.name, $.output.username)
+                      country.$: States.ArrayGetItem(States.StringSplit($.output.country, '/'), 4)
+              MaxConcurrency: 40
+              ItemsPath: $.players
+              Next: Aggregate countries
+            Aggregate countries:
+              Type: Pass
+              Parameters:
+                original.$: $
+                countries.$: States.ArrayUnique($[*].country)
+                countriesCount.$: States.ArrayLength(States.ArrayUnique($[*].country))
+                iterator: 0
+                output: {}
+              Next: Is fully aggregated?
+            Is fully aggregated?:
+              Type: Choice
+              Choices:
+                - Variable: $.iterator
+                  NumericLessThanPath: $.countriesCount
+                  Next: Choose a country
+              Default: Finish
+            Choose a country:
+              Type: Pass
+              Next: Aggregate
+              Parameters:
+                original.$: $.original
+                countries.$: $.countries
+                countriesCount.$: $.countriesCount
+                iterator.$: $.iterator
+                output.$: $.output
+                country.$: States.ArrayGetItem($.countries, $.iterator)
+            Aggregate:
+              Type: Pass
+              Parameters:
+                original.$: $.original
+                countries.$: $.countries
+                countriesCount.$: $.countriesCount
+                iterator.$: States.MathAdd($.iterator, 1)
+                output.$: States.JsonMerge(States.StringToJson(States.Format('\{"{}":{}\}', $.country, States.JsonToString($.original[?(@.country == $.country)]['displayName']))), $.output, false)
+              Next: Is fully aggregated?
+            Finish:
+              Type: Pass
+              End: true
+              Parameters:
+                grandmastersByCountry.$: $.output
+
+  StateMachineIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: GetGMsByCountryStepFunctionsRole
+      Path: /service-role/
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+                aws:SourceArn: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:*
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - states:InvokeHTTPEndpoint
+                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:GetGMsByCountry
+                Condition:
+                  StringLike:
+                    states:HTTPEndpoint:
+                      - https://api.chess.com/*
+                  StringEquals:
+                    states:HTTPMethod:
+                      - GET
+              - Effect: Allow
+                Action:
+                  - events:RetrieveConnectionCredentials
+                Resource: !GetAtt EventsConnection.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !GetAtt EventsConnection.SecretArn
